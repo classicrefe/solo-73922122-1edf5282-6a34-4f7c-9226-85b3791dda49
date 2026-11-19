@@ -25,4 +25,13 @@ SCAN_ROW_DELAY_MS = _int_env("SCAN_ROW_DELAY_MS", 0)
 SOURCES_DIR = DATA_DIR / "sources"
 RESULTS_DIR = DATA_DIR / "results"
 SCANS_DIR = DATA_DIR / "scans"
+
+# 小时放行审计：中间聚合库（临时，重启即清）与最终报告目录（持久）
+AUDITS_TMP_DIR = DATA_DIR / "audits_tmp"
+AUDIT_REPORTS_DIR = DATA_DIR / "reports"
 DB_PATH = DATA_DIR / "app.db"
+
+# 审计窗口最多覆盖 24 个整点小时
+AUDIT_MAX_HOURS = 24
+# 审计线程每隔多少行提交一次暂存库 / 检查停止信号
+AUDIT_BATCH_ROWS = 5000

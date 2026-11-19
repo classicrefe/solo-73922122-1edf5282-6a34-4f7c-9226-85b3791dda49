@@ -34,12 +34,26 @@ def parse_row(line: str, line_no: int) -> tuple[str, datetime, int]:
     """解析并校验一行数据，返回 (站号, UTC 时刻, 整数温度)。
 
     非法行抛 CsvFormatError，携带行号便于定位。
+
+    无引号且恰有两个逗号的行走 str.split 快路径（与 csv.reader 结果一致，
+    因为此时字段内不可能出现逗号、换行或转义）；其余行交给 csv.reader。
     """
-    reader = csv.reader(io.StringIO(line))
-    try:
-        fields = next(reader)
-    except StopIteration:
-        raise CsvFormatError(f"第 {line_no} 行：空行")
+    # 快路径：单行、无引号、恰有两个逗号时 split 与 csv.reader 等价
+    body = line[:-1] if line.endswith("\n") else line
+    body = body[:-1] if body.endswith("\r") else body
+    if (
+        body.count(",") == 2
+        and '"' not in body
+        and "\n" not in body
+        and "\r" not in body
+    ):
+        fields = body.split(",")
+    else:
+        reader = csv.reader(io.StringIO(line))
+        try:
+            fields = next(reader)
+        except StopIteration:
+            raise CsvFormatError(f"第 {line_no} 行：空行")
     if len(fields) != 3:
         raise CsvFormatError(f"第 {line_no} 行：应为 3 列，实际 {len(fields)} 列")
 

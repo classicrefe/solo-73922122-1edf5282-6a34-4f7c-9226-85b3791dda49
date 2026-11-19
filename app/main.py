@@ -1,7 +1,8 @@
-"""FastAPI 应用：上传原件、受理筛选任务、查询/取消/下载。
+"""FastAPI 应用：上传原件、受理筛选任务、查询/取消/下载、小时放行审计。
 
-查询与任务受理接口均为异步立即返回，不等待后台扫描；扫描进度通过
-GET /tasks/{id} 的 scanned_rows / matched_rows 观察。
+查询、任务受理与审计受理接口均为异步立即返回，不等待后台扫描/审计；
+扫描进度通过 GET /tasks/{id} 的 scanned_rows 观察，审计状态经
+GET /hour-audits/{id} 观察。
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from . import config
+from .audit import AuditManager, AuditRangeError
 from .csvutil import HEADER, CsvFormatError, validate_header
 from .db import Database
 from .scan import ScanManager, _now
@@ -60,16 +62,50 @@ class TaskCreate(BaseModel):
     temp_max: int
 
 
+class AuditCreate(BaseModel):
+    source_id: str = Field(description="已上传原件的 ID")
+    range_start: str = Field(
+        description="UTC 整点起点（含），如 2026-01-01T00:00:00Z；非 UTC 偏移会先归一化"
+    )
+    range_end: str = Field(
+        description="UTC 整点终点（不含），跨度不超过 24 小时"
+    )
+
+
+def _audit_to_dict(row) -> dict:
+    return {
+        "audit_id": row["id"],
+        "source_id": row["source_id"],
+        "range_start": row["range_start"],
+        "range_end": row["range_end"],
+        "status": row["status"],
+        "error": row["error"],
+        "report_available": row["status"] == "completed",
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    for d in (config.DATA_DIR, config.SOURCES_DIR, config.RESULTS_DIR, config.SCANS_DIR):
+    for d in (
+        config.DATA_DIR,
+        config.SOURCES_DIR,
+        config.RESULTS_DIR,
+        config.SCANS_DIR,
+        config.AUDITS_TMP_DIR,
+        config.AUDIT_REPORTS_DIR,
+    ):
         d.mkdir(parents=True, exist_ok=True)
     app.state.db = Database(config.DB_PATH)
     app.state.manager = ScanManager(app.state.db)
-    # 重启恢复：未完任务标记 interrupted，清理遗留暂存
+    app.state.audits = AuditManager(app.state.db)
+    # 重启恢复：未完任务/审计标记 interrupted，清理遗留暂存
     app.state.manager.recover_on_startup()
+    app.state.audits.recover_on_startup()
     yield
-    # 先停在途扫描并等待线程退出，再关闭 DB，防止线程访问已关闭连接
+    # 先停在途扫描/审计并等待线程退出，再关闭 DB，防止线程访问已关闭连接
+    app.state.audits.shutdown()
     app.state.manager.shutdown()
     app.state.db.close()
 
@@ -79,9 +115,11 @@ app = FastAPI(
     description=(
         "上传至多 256 MiB 的观测 CSV（station, utc_time, temperature），"
         "按站号集合与温度闭区间提取子集。同原件的在途任务共享一次源扫描，"
-        "支持迟到补入与即时取消。"
+        "支持迟到补入与即时取消。\n\n"
+        "另提供**观测原件小时放行**：按 UTC 整点窗口逐站逐小时核对 60 个整分"
+        "采样，只在整份原件校验通过后发布审计报告。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -246,6 +284,62 @@ def download_result(task_id: str):
     )
 
 
+# ---------------------------------------------------------------- 小时放行审计
+@app.post("/hour-audits", status_code=202)
+def create_hour_audit(body: AuditCreate):
+    """受理小时放行审计，立即返回；后台逐行校验原件并生成报告。"""
+    try:
+        state = app.state.audits.create_audit(
+            body.source_id, body.range_start, body.range_end
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="source 不存在")
+    except AuditRangeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    data = state.public()
+    data["detail"] = "审计已受理，完成后经 GET /hour-audits/{audit_id}/report 获取报告"
+    return data
+
+
+@app.get("/hour-audits")
+def list_hour_audits():
+    return [_audit_to_dict(r) for r in app.state.db.list_audits()]
+
+
+@app.get("/hour-audits/{audit_id}")
+def get_hour_audit(audit_id: str):
+    row = app.state.db.get_audit(audit_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="audit 不存在")
+    return _audit_to_dict(row)
+
+
+@app.get("/hour-audits/{audit_id}/report")
+def download_hour_audit_report(audit_id: str):
+    row = app.state.db.get_audit(audit_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="audit 不存在")
+    if row["status"] != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"审计状态为 {row['status']}，报告尚未开放"
+                "（整份原件校验通过且处理完成后才发布）"
+            ),
+        )
+    report_value = row["report_path"]
+    if not report_value:
+        raise HTTPException(status_code=410, detail="报告文件已丢失")
+    report = Path(report_value)
+    if not report.exists():
+        raise HTTPException(status_code=410, detail="报告文件已丢失")
+    return FileResponse(
+        report,
+        media_type="application/json",
+        filename=f"{audit_id}.json",
+    )
+
+
 @app.get("/", response_class=PlainTextResponse)
 def root():
     return (
@@ -254,4 +348,6 @@ def root():
         "- 健康检查：/health\n"
         f"- 上传上限：{config.MAX_UPLOAD_BYTES} 字节\n"
         f"- CSV 表头：{','.join(HEADER)}\n"
+        "- 小时放行审计：POST /hour-audits，报告 GET /hour-audits/{id}/report\n"
+        f"- 审计窗口最长：{config.AUDIT_MAX_HOURS} 小时（UTC 整点）\n"
     )

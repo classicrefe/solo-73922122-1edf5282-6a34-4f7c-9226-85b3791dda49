@@ -30,11 +30,24 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS audits (
+    id            TEXT PRIMARY KEY,
+    source_id     TEXT NOT NULL,
+    range_start   TEXT NOT NULL,
+    range_end     TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    report_path   TEXT,
+    error         TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
 """
 
 # 重启时视为中断的非终态
 ACTIVE_STATUSES = ("pending", "running", "cancelling")
 TERMINAL_STATUSES = ("completed", "failed", "cancelled", "interrupted")
+AUDIT_ACTIVE_STATUSES = ("pending", "running")
+AUDIT_TERMINAL_STATUSES = ("completed", "failed", "interrupted")
 
 
 class Database:
@@ -50,6 +63,8 @@ class Database:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(SCHEMA)
         self._conn.commit()
+        # 重启恢复时被标中断的审计 id（供清理暂存目录使用）
+        self.interrupted_audit_ids: list[str] = []
 
     # -- sources -----------------------------------------------------------
     def insert_source(
@@ -97,6 +112,65 @@ class Database:
     def get_row_delay(self, source_id: str) -> int:
         row = self.get_source(source_id)
         return int(row["row_delay_ms"]) if row else 0
+
+    # -- audits ------------------------------------------------------------
+    def insert_audit(
+        self,
+        audit_id: str,
+        source_id: str,
+        range_start: str,
+        range_end: str,
+        now: str,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO audits (id, source_id, range_start, range_end,"
+                " status, created_at, updated_at)"
+                " VALUES (?,?,?,?, 'pending', ?, ?)",
+                (audit_id, source_id, range_start, range_end, now, now),
+            )
+            self._conn.commit()
+
+    def update_audit(
+        self,
+        audit_id: str,
+        status: str | None = None,
+        report_path: str | None = None,
+        error: str | None = None,
+        now: str | None = None,
+    ) -> None:
+        sets: list[str] = []
+        params: list[object] = []
+        if status is not None:
+            sets.append("status=?")
+            params.append(status)
+        if report_path is not None:
+            sets.append("report_path=?")
+            params.append(report_path)
+        if error is not None:
+            sets.append("error=?")
+            params.append(error)
+        if now is not None:
+            sets.append("updated_at=?")
+            params.append(now)
+        if not sets:
+            return
+        params.append(audit_id)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE audits SET {', '.join(sets)} WHERE id=?", params
+            )
+            self._conn.commit()
+
+    def get_audit(self, audit_id: str) -> sqlite3.Row | None:
+        with self._lock:
+            cur = self._conn.execute("SELECT * FROM audits WHERE id=?", (audit_id,))
+            return cur.fetchone()
+
+    def list_audits(self) -> list[sqlite3.Row]:
+        with self._lock:
+            cur = self._conn.execute("SELECT * FROM audits ORDER BY created_at")
+            return cur.fetchall()
 
     # -- tasks -------------------------------------------------------------
     def insert_task(
@@ -168,7 +242,7 @@ class Database:
             return cur.fetchall()
 
     def interrupt_active_tasks(self) -> list[str]:
-        """重启恢复：所有非终态任务标记为 interrupted，返回任务 id 列表。"""
+        """重启恢复：所有非终态任务（含小时审计）标记为 interrupted。"""
         with self._lock:
             placeholders = ",".join("?" for _ in ACTIVE_STATUSES)
             cur = self._conn.execute(
@@ -181,6 +255,18 @@ class Database:
                 f" error='服务重启，任务中断', updated_at=datetime('now')"
                 f" WHERE status IN ({placeholders})",
                 ACTIVE_STATUSES,
+            )
+            audit_placeholders = ",".join("?" for _ in AUDIT_ACTIVE_STATUSES)
+            audit_cur = self._conn.execute(
+                f"SELECT id FROM audits WHERE status IN ({audit_placeholders})",
+                AUDIT_ACTIVE_STATUSES,
+            )
+            self.interrupted_audit_ids = [r["id"] for r in audit_cur.fetchall()]
+            self._conn.execute(
+                f"UPDATE audits SET status='interrupted',"
+                f" error='服务重启，审计中断', updated_at=datetime('now')"
+                f" WHERE status IN ({audit_placeholders})",
+                AUDIT_ACTIVE_STATUSES,
             )
             self._conn.execute(
                 "UPDATE sources SET status='interrupted' WHERE status IN"
